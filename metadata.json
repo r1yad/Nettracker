@@ -1,0 +1,6 @@
+{
+  "name": "NetTrack",
+  "description": "Background internet data usage tracker with daily and monthly alerts, per-app breakdown, and threshold notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
