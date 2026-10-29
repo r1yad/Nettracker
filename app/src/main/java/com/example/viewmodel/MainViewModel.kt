@@ -57,6 +57,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         checkPermissions()
         observePreferencesAndDb()
         refreshData()
+        viewModelScope.launch(Dispatchers.IO) {
+            com.example.data.local.AppInfoCache.preloadCommonAppInfo(application)
+        }
     }
 
     private fun observePreferencesAndDb() {
@@ -199,6 +202,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             DataTrackerService.stop(getApplication())
         }
+        com.example.widget.NetTrackWidgetProvider.updateAllWidgets(getApplication())
         refreshData()
     }
 

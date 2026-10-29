@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">NetTrack</string>
+    <string name="widget_description">Daily Cellular and Wi-Fi data usage side-by-side with circular limit dial</string>
 </resources>

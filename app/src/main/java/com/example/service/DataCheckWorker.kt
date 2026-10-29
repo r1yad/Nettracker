@@ -13,6 +13,7 @@ import com.example.data.local.PreferencesManager
 import com.example.data.model.AlertType
 import com.example.data.model.TimeSpan
 import com.example.data.network.NetworkStatsHelper
+import com.example.widget.NetTrackWidgetProvider
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -35,20 +36,18 @@ class DataCheckWorker(
         val todayDateKey = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val currentMonthKey = SimpleDateFormat("yyyy-MM", Locale.getDefault()).format(Date())
 
-        val apps = NetworkStatsHelper.getAppsUsage(applicationContext, todayStart, todayEnd)
-        val topApp = apps.firstOrNull()
-
         // Persist daily record
         database.appDao().insertOrUpdateDailyUsage(
             DailyUsageRecord(
                 date = todayDateKey,
                 mobileBytes = todayUsage.mobileBytes,
                 wifiBytes = todayUsage.wifiBytes,
-                totalBytes = todayUsage.totalBytes,
-                topAppName = topApp?.appName,
-                topAppBytes = topApp?.totalBytes
+                totalBytes = todayUsage.totalBytes
             )
         )
+
+        // Update home screen widget
+        NetTrackWidgetProvider.updateAllWidgets(applicationContext)
 
         // Threshold checks (Daily)
         if (thresholds.dailyAlertEnabled && thresholds.dailyLimitMb > 0) {
@@ -124,11 +123,13 @@ class DataCheckWorker(
             }
         }
 
-        // Daily evening summary check
+        // Daily evening summary check (only scans apps when needed)
         if (thresholds.dailyReportEnabled) {
             val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
             if (hour >= 20 && !prefsManager.hasDailyReportSent(todayDateKey)) {
                 prefsManager.setDailyReportSent(todayDateKey)
+                val apps = NetworkStatsHelper.getAppsUsage(applicationContext, todayStart, todayEnd)
+                val topApp = apps.firstOrNull()
                 NotificationHelper.showDailySummary(
                     context = applicationContext,
                     todayTotalBytes = todayUsage.totalBytes,

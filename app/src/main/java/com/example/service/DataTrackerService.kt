@@ -2,8 +2,10 @@ package com.example.service
 
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkRequest
@@ -16,6 +18,7 @@ import com.example.data.local.PreferencesManager
 import com.example.data.model.AlertType
 import com.example.data.model.TimeSpan
 import com.example.data.network.NetworkStatsHelper
+import com.example.widget.NetTrackWidgetProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +41,26 @@ class DataTrackerService : Service() {
     private lateinit var database: AppDatabase
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    private var lastCheckedTotalBytes = 0L
+    private var lastCheckedDate = ""
+
+    // Screen state listener to pause polling when screen is off (ultra-low battery usage)
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_ON -> {
+                    // Screen turned on: perform quick check and resume gentle tracking loop
+                    serviceScope.launch { checkAndUpdateUsage() }
+                    startTrackingLoop()
+                }
+                Intent.ACTION_SCREEN_OFF -> {
+                    // Screen turned off: pause active polling loop to allow Android Doze mode
+                    stopTrackingLoop()
+                }
+            }
+        }
+    }
 
     companion object {
         private val _isServiceRunning = MutableStateFlow(false)
@@ -64,12 +87,12 @@ class DataTrackerService : Service() {
         database = AppDatabase.getDatabase(applicationContext)
         NotificationHelper.createNotificationChannels(this)
         registerNetworkCallback()
+        registerScreenStateReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         _isServiceRunning.value = true
 
-        // Display initial notification immediately to satisfy foreground service requirements
         val thresholds = prefsManager.getThresholds()
         val initialNotification = NotificationHelper.buildForegroundNotification(
             context = this,
@@ -80,9 +103,7 @@ class DataTrackerService : Service() {
         )
         try {
             startForeground(NotificationHelper.NOTIFICATION_ID_FOREGROUND, initialNotification)
-        } catch (e: Exception) {
-            // Android 14+ specialUse foreground service start safety
-        }
+        } catch (_: Exception) {}
 
         startTrackingLoop()
 
@@ -94,54 +115,67 @@ class DataTrackerService : Service() {
         trackingJob = serviceScope.launch {
             while (isActive) {
                 checkAndUpdateUsage()
-                delay(25_000) // Check every 25 seconds
+                // Adaptive gentle interval: 3 minutes while screen is on
+                delay(180_000)
             }
         }
     }
 
-    private suspend fun checkAndUpdateUsage() {
+    private fun stopTrackingLoop() {
+        trackingJob?.cancel()
+        trackingJob = null
+    }
+
+    private suspend fun checkAndUpdateUsage(forceUpdate: Boolean = false) {
         val thresholds = prefsManager.getThresholds()
         val (todayStart, todayEnd) = NetworkStatsHelper.getTimeRange(TimeSpan.TODAY)
-        val todayUsage = NetworkStatsHelper.getDeviceUsage(this, todayStart, todayEnd)
 
-        // 1. Update foreground notification
-        val notification = NotificationHelper.buildForegroundNotification(
-            context = this,
-            todayTotalBytes = todayUsage.totalBytes,
-            todayWifiBytes = todayUsage.wifiBytes,
-            todayMobileBytes = todayUsage.mobileBytes,
-            dailyLimitMb = thresholds.dailyLimitMb
-        )
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        try {
-            notificationManager.notify(NotificationHelper.NOTIFICATION_ID_FOREGROUND, notification)
-        } catch (_: Exception) {}
+        // Ultra-lightweight device-level check (takes <2ms)
+        val todayUsage = NetworkStatsHelper.getDeviceUsage(this, todayStart, todayEnd)
 
         val todayDateKey = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val currentMonthKey = SimpleDateFormat("yyyy-MM", Locale.getDefault()).format(Date())
 
-        // 2. Query top app for snapshot record
-        val apps = NetworkStatsHelper.getAppsUsage(this, todayStart, todayEnd)
-        val topApp = apps.firstOrNull()
+        val delta = Math.abs(todayUsage.totalBytes - lastCheckedTotalBytes)
+        val isNewDay = todayDateKey != lastCheckedDate
 
-        // Persist daily record
-        database.appDao().insertOrUpdateDailyUsage(
-            DailyUsageRecord(
-                date = todayDateKey,
-                mobileBytes = todayUsage.mobileBytes,
-                wifiBytes = todayUsage.wifiBytes,
-                totalBytes = todayUsage.totalBytes,
-                topAppName = topApp?.appName,
-                topAppBytes = topApp?.totalBytes
+        // Only update UI/notification/database if data changed significantly (>= 1MB) or new day or forced
+        if (delta >= (1024L * 1024L) || isNewDay || forceUpdate) {
+            lastCheckedTotalBytes = todayUsage.totalBytes
+            lastCheckedDate = todayDateKey
+
+            // 1. Update foreground notification
+            val notification = NotificationHelper.buildForegroundNotification(
+                context = this,
+                todayTotalBytes = todayUsage.totalBytes,
+                todayWifiBytes = todayUsage.wifiBytes,
+                todayMobileBytes = todayUsage.mobileBytes,
+                dailyLimitMb = thresholds.dailyLimitMb
             )
-        )
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            try {
+                notificationManager.notify(NotificationHelper.NOTIFICATION_ID_FOREGROUND, notification)
+            } catch (_: Exception) {}
 
-        // 3. Threshold Checks (Daily)
+            // 2. Persist daily snapshot
+            database.appDao().insertOrUpdateDailyUsage(
+                DailyUsageRecord(
+                    date = todayDateKey,
+                    mobileBytes = todayUsage.mobileBytes,
+                    wifiBytes = todayUsage.wifiBytes,
+                    totalBytes = todayUsage.totalBytes
+                )
+            )
+
+            // 3. Update Home Screen Widgets
+            NetTrackWidgetProvider.updateAllWidgets(this)
+        }
+
+        // 4. Threshold Checks (Daily)
         if (thresholds.dailyAlertEnabled && thresholds.dailyLimitMb > 0) {
             val dailyLimitBytes = NetworkStatsHelper.mbToBytes(thresholds.dailyLimitMb)
             val warningBytes = (dailyLimitBytes * (thresholds.dailyWarningPercent / 100.0)).toLong()
 
-            // Daily Exceeded Check
             if (todayUsage.totalBytes >= dailyLimitBytes && !prefsManager.hasDailyExceededFired(todayDateKey)) {
                 prefsManager.setDailyExceededFired(todayDateKey)
                 NotificationHelper.showThresholdAlert(
@@ -161,9 +195,7 @@ class DataTrackerService : Service() {
                         thresholdBytes = dailyLimitBytes
                     )
                 )
-            }
-            // Daily Warning Check
-            else if (todayUsage.totalBytes >= warningBytes && !prefsManager.hasDailyWarningFired(todayDateKey) && !prefsManager.hasDailyExceededFired(todayDateKey)) {
+            } else if (todayUsage.totalBytes >= warningBytes && !prefsManager.hasDailyWarningFired(todayDateKey) && !prefsManager.hasDailyExceededFired(todayDateKey)) {
                 prefsManager.setDailyWarningFired(todayDateKey)
                 NotificationHelper.showThresholdAlert(
                     this,
@@ -185,14 +217,13 @@ class DataTrackerService : Service() {
             }
         }
 
-        // 4. Threshold Checks (Monthly)
+        // 5. Threshold Checks (Monthly)
         if (thresholds.monthlyAlertEnabled && thresholds.monthlyLimitMb > 0) {
             val (monthStart, monthEnd) = NetworkStatsHelper.getBillingCycleRange(thresholds.billingCycleDay)
             val monthUsage = NetworkStatsHelper.getDeviceUsage(this, monthStart, monthEnd)
             val monthlyLimitBytes = NetworkStatsHelper.mbToBytes(thresholds.monthlyLimitMb)
             val monthlyWarningBytes = (monthlyLimitBytes * (thresholds.monthlyWarningPercent / 100.0)).toLong()
 
-            // Monthly Exceeded
             if (monthUsage.totalBytes >= monthlyLimitBytes && !prefsManager.hasMonthlyExceededFired(currentMonthKey)) {
                 prefsManager.setMonthlyExceededFired(currentMonthKey)
                 NotificationHelper.showThresholdAlert(
@@ -212,9 +243,7 @@ class DataTrackerService : Service() {
                         thresholdBytes = monthlyLimitBytes
                     )
                 )
-            }
-            // Monthly Warning
-            else if (monthUsage.totalBytes >= monthlyWarningBytes && !prefsManager.hasMonthlyWarningFired(currentMonthKey) && !prefsManager.hasMonthlyExceededFired(currentMonthKey)) {
+            } else if (monthUsage.totalBytes >= monthlyWarningBytes && !prefsManager.hasMonthlyWarningFired(currentMonthKey) && !prefsManager.hasMonthlyExceededFired(currentMonthKey)) {
                 prefsManager.setMonthlyWarningFired(currentMonthKey)
                 NotificationHelper.showThresholdAlert(
                     this,
@@ -236,11 +265,14 @@ class DataTrackerService : Service() {
             }
         }
 
-        // 5. Daily Summary Report Check
+        // 6. Evening Daily Summary Report (runs only once per day)
         if (thresholds.dailyReportEnabled) {
             val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
             if (hour >= 20 && !prefsManager.hasDailyReportSent(todayDateKey)) {
                 prefsManager.setDailyReportSent(todayDateKey)
+                // Only scan apps when generating the summary
+                val apps = NetworkStatsHelper.getAppsUsage(this, todayStart, todayEnd)
+                val topApp = apps.firstOrNull()
                 NotificationHelper.showDailySummary(
                     context = this,
                     todayTotalBytes = todayUsage.totalBytes,
@@ -259,20 +291,33 @@ class DataTrackerService : Service() {
             val request = NetworkRequest.Builder().build()
             networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    serviceScope.launch { checkAndUpdateUsage() }
+                    serviceScope.launch { checkAndUpdateUsage(forceUpdate = true) }
                 }
                 override fun onLost(network: Network) {
-                    serviceScope.launch { checkAndUpdateUsage() }
+                    serviceScope.launch { checkAndUpdateUsage(forceUpdate = true) }
                 }
             }
             networkCallback?.let { connectivityManager?.registerNetworkCallback(request, it) }
         } catch (_: Exception) {}
     }
 
+    private fun registerScreenStateReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        try {
+            registerReceiver(screenStateReceiver, filter)
+        } catch (_: Exception) {}
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         _isServiceRunning.value = false
-        trackingJob?.cancel()
+        stopTrackingLoop()
+        try {
+            unregisterReceiver(screenStateReceiver)
+        } catch (_: Exception) {}
         try {
             networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
         } catch (_: Exception) {}

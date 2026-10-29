@@ -1,9 +1,5 @@
 package com.example.ui.components
 
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.drawable.BitmapDrawable
-import android.graphics.drawable.Drawable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -21,6 +17,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.example.data.local.AppInfoCache
 
 @Composable
 fun AppIconImage(
@@ -29,13 +26,7 @@ fun AppIconImage(
 ) {
     val context = LocalContext.current
     val bitmap = remember(packageName) {
-        try {
-            val pm = context.packageManager
-            val drawable: Drawable = pm.getApplicationIcon(packageName)
-            drawableToBitmap(drawable)
-        } catch (_: Exception) {
-            null
-        }
+        AppInfoCache.getOrLoadIcon(context, packageName)
     }
 
     if (bitmap != null) {
@@ -59,17 +50,4 @@ fun AppIconImage(
             )
         }
     }
-}
-
-private fun drawableToBitmap(drawable: Drawable): Bitmap {
-    if (drawable is BitmapDrawable && drawable.bitmap != null) {
-        return drawable.bitmap
-    }
-    val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 96
-    val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 96
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val canvas = Canvas(bitmap)
-    drawable.setBounds(0, 0, canvas.width, canvas.height)
-    drawable.draw(canvas)
-    return bitmap
 }
