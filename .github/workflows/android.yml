@@ -34,6 +34,21 @@ jobs:
       - name: Grant Execute Permission for Gradlew
         run: chmod +x ./gradlew
 
+      - name: Generate Debug Keystore
+        run: |
+          if [ ! -f "debug.keystore" ]; then
+            echo "Generating debug.keystore for CI signing..."
+            keytool -genkeypair \
+              -alias androiddebugkey \
+              -keypass android \
+              -keystore debug.keystore \
+              -storepass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000
+          fi
+
       - name: Run Unit & Robolectric Tests
         run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
 
